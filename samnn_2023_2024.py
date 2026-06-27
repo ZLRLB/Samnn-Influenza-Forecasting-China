@@ -1,0 +1,461 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib
+from tensorflow.keras.layers import Input, Dense, Embedding, Flatten, concatenate, Dropout, Multiply, Activation, Lambda
+from tensorflow.keras.models import Model
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.model_selection import GroupKFold
+from scipy.stats import t
+import matplotlib.pyplot as plt
+import sys
+from matplotlib import font_manager
+
+def set_seed(seed=42):
+    np.random.seed(seed)
+    random.seed(seed)
+    tf.random.set_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+set_seed(42)
+
+font_path = "C:/Windows/Fonts/msyh.ttc"
+myfont = font_manager.FontProperties(fname=font_path)
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+BASE_CLIMATE = [
+    'absolute_humidity', 'uvindex', 'solarenergy', 'solarradiation', 'visibility',
+    'cloudcover', 'winddir', 'windspeed', 'humidity', 'feelslike', 'temp', 'DTR'
+]
+BASE_SOCIAL = ['holiday', 'trend_stage', 'H1N1_flu_season']
+TARGET = 'H1N1_ILI%×positive%_national'
+
+# ============================================================
+# Forecast-horizon configuration
+# lead=1: lag1-lag4
+# lead=2: lag2-lag5
+# lead=4: lag4-lag7
+# ============================================================
+FORECAST_LEAD = 4   # Set to 1, 2, or 4 for the corresponding forecast horizon
+
+# Input file containing epidemiological lag variables for weeks 1-7
+DATA_FILE = "2011-2024AH1N1预测数据(返修).csv"
+
+
+def get_epi_cols_for_lead(lead):
+    """
+    Select epidemiological lag inputs according to the forecast horizon.
+    Retain four epidemiological inputs at each horizon to preserve the model input structure.
+    """
+    if lead == 1:
+        return [
+            'H1N1_ILI%×positive%_national_lag_1_week',
+            'H1N1_ILI%×positive%_national_lag_2_week',
+            'H1N1_ILI%×positive%_national_lag_3_week',
+            'H1N1_ILI%×positive%_national_lag_4_week'
+        ]
+
+    elif lead == 2:
+        return [
+            'H1N1_ILI%×positive%_national_lag_2_week',
+            'H1N1_ILI%×positive%_national_lag_3_week',
+            'H1N1_ILI%×positive%_national_lag_4_week',
+            'H1N1_ILI%×positive%_national_lag_5_week'
+        ]
+
+    elif lead == 4:
+        return [
+            'H1N1_ILI%×positive%_national_lag_4_week',
+            'H1N1_ILI%×positive%_national_lag_5_week',
+            'H1N1_ILI%×positive%_national_lag_6_week',
+            'H1N1_ILI%×positive%_national_lag_7_week'
+        ]
+
+    else:
+        raise ValueError("FORECAST_LEAD must be 1, 2, or 4")
+
+
+BASE_EPIDEMIOLOGY = get_epi_cols_for_lead(FORECAST_LEAD)
+
+print(f"\nCurrent SAMNN configuration: {FORECAST_LEAD}-week ahead forecasting")
+print("Epidemiological lag columns:")
+for c in BASE_EPIDEMIOLOGY:
+    print("  ", c)
+
+STAGE_COL = 'time_part_code'
+
+PREDICT_START = "2023-10-04"
+PREDICT_END = "2024-04-03"
+EPOCHS = 100
+BATCH_SIZE = 16
+SEED = 42
+WINDOW = 4  # Window length
+
+
+def moving_average(series, window_size):
+    return series.rolling(window_size, min_periods=1).mean()
+
+
+def build_features(df):
+    window_size = 4
+    df['TARGET_smoothed'] = moving_average(df[TARGET], window_size)
+    for col in BASE_CLIMATE:
+        df[col] = df[col].fillna(method='ffill').fillna(method='bfill').fillna(df[col].mean())
+    for col in BASE_SOCIAL:
+        df[col] = df[col].astype('category').cat.codes.fillna(0)
+    if "time_part" not in df.columns:
+        df["time_part"] = np.where(df["time"].dt.year < 2020, "pre", "after")
+    df[STAGE_COL] = df["time_part"].astype("category").cat.codes
+    df = df.dropna(subset=BASE_EPIDEMIOLOGY + BASE_CLIMATE + BASE_SOCIAL)
+    return df
+
+
+def assign_season_groups(df):
+    df = df.sort_values('time').reset_index(drop=True)
+    season_group = np.zeros(len(df), dtype=int)
+    group = 0
+    in_season = False
+    for i in range(len(df)):
+        if df.loc[i, 'H1N1_flu_season'] == 1:
+            if not in_season:
+                group += 1
+                in_season = True
+            season_group[i] = group
+        else:
+            in_season = False
+    df['season_group'] = season_group
+    return df
+
+
+def is_anomaly_season(stat_mean, stat_var, mean_thres=0.01, var_thres=0.001):
+    return (stat_mean < mean_thres) and (stat_var < var_thres)
+
+
+def abnormal_season_groups(df):
+    stats = df.groupby('season_group')[TARGET].agg(['mean','var'])
+    abnormal = stats[(stats['mean'] < 0.01) & (stats['var'] < 0.001)].index.tolist()
+    return abnormal
+
+
+def load_train_data():
+    df = pd.read_csv(DATA_FILE, parse_dates=["time"])
+    df = build_features(df)
+    df = assign_season_groups(df)
+    mask = (df["time"] < pd.to_datetime(PREDICT_START))
+    df_train = df[mask].reset_index(drop=True)
+    df_train = df_train[df_train['season_group'] > 0].reset_index(drop=True)
+    abnormal = abnormal_season_groups(df_train)
+    df_train = df_train[~df_train['season_group'].isin(abnormal)].reset_index(drop=True)
+    print(f"Excluded low-activity season groups: {abnormal}")
+    return df_train
+
+def load_full_data():
+    df = pd.read_csv(DATA_FILE, parse_dates=["time"])
+    df = build_features(df)
+    df = assign_season_groups(df)
+    return df
+
+def get_inputs(df):
+    epi_cols = BASE_EPIDEMIOLOGY
+    climate_cols = BASE_CLIMATE
+    social_cols = BASE_SOCIAL
+    stage_col = [STAGE_COL]
+    X_epi = df[epi_cols].values.astype(np.float32)
+    X_climate = df[climate_cols].values.astype(np.float32)
+    X_social = df[social_cols].values.astype(np.int32)
+    X_stage = df[stage_col].values.astype(np.float32)
+    y = df[TARGET].values
+    return X_epi, X_climate, X_social, X_stage, y
+
+
+def build_multimodal_weighted_model():
+    # Branch definitions
+    inp_epi = Input(shape=(len(BASE_EPIDEMIOLOGY),), name='epi_input')
+    x_epi = Dense(32, activation='relu')(inp_epi)
+
+    inp_climate = Input(shape=(len(BASE_CLIMATE),), name='climate_input')
+    x_climate = Dense(16, activation='relu')(inp_climate)
+
+    inp_social = Input(shape=(len(BASE_SOCIAL),), name='social_input')
+    x_social = Embedding(input_dim=4, output_dim=4, input_length=len(BASE_SOCIAL))(inp_social)
+    x_social = Flatten()(x_social)
+    x_social = Dense(8, activation='relu')(x_social)
+
+    inp_stage = Input(shape=(1,), name='stage_input')
+
+    # Feature list before fusion
+    branch_features = [x_epi, x_climate, x_social, inp_stage]
+    branch_concat = concatenate(branch_features)
+
+    # Generate learnable branch weights with softmax normalization
+    weight_logits = Dense(len(branch_features), activation=None)(branch_concat)
+    weights = Activation('softmax', name='fusion_weights')(weight_logits)
+    split_weights = tf.split(weights, num_or_size_splits=len(branch_features), axis=1)
+
+    # Scale each branch by its corresponding weight
+    x_epi_w = Multiply()([x_epi, split_weights[0]])
+    x_climate_w = Multiply()([x_climate, split_weights[1]])
+    x_social_w = Multiply()([x_social, split_weights[2]])
+    x_stage_w = Multiply()([inp_stage, split_weights[3]])
+
+    x_fused = concatenate([x_epi_w, x_climate_w, x_social_w, x_stage_w])
+    x = Dense(16, activation='relu')(x_fused)
+    x = Dropout(0.1)(x)
+    out = Dense(1, activation='relu')(x)
+
+    model = Model(inputs=[inp_epi, inp_climate, inp_social, inp_stage], outputs=out)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.002),
+        loss='mse',
+        metrics=['mae']
+    )
+    return model
+
+
+def calc_metrics(y_true, y_pred):
+    r2 = r2_score(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    return r2, mae, rmse
+
+
+def get_early_stopping(validation=False):
+    if validation:
+        return tf.keras.callbacks.EarlyStopping(
+            patience=10, restore_best_weights=True, monitor='val_loss'
+        )
+    else:
+        return tf.keras.callbacks.EarlyStopping(
+            patience=10, restore_best_weights=True, monitor='loss'
+        )
+
+
+def get_sample_weight(df):
+    return np.where(df['time_part'] == 'after', 2.0, 1.0)
+
+def save_predict_result_csv(y_pred, lower, upper, y_true, dates, filename):
+    df_save = pd.DataFrame({
+        "date": pd.to_datetime(dates),
+        "y_true": y_true if y_true is not None else [np.nan]*len(y_pred),
+        "y_pred": y_pred,
+        "lower": lower,
+        "upper": upper
+    })
+    df_save.to_csv(filename, index=False, encoding="utf-8-sig")
+    print(f"Prediction results saved to {filename}")
+
+def get_predict_samples_full_window(df_all, train_end_time, window, target_times):
+    epi_cols = BASE_EPIDEMIOLOGY
+    climate_cols = BASE_CLIMATE
+    social_cols = BASE_SOCIAL
+    stage_col = [STAGE_COL]
+    features_epi, features_climate, features_social, features_stage, targets, dates = [], [], [], [], [], []
+    df_all = df_all.reset_index(drop=True)
+    time_to_idx = {row['time']: idx for idx, row in df_all.iterrows()}
+    train_last_idx = None
+    for idx, row in df_all.iterrows():
+        if row['time'] < pd.to_datetime(PREDICT_START):
+            train_last_idx = idx
+    for t in target_times:
+        idx = time_to_idx.get(t)
+        if idx is None: continue
+        features_epi.append(df_all.iloc[idx][epi_cols].astype(np.float32).values)
+        features_climate.append(df_all.iloc[idx][climate_cols].astype(np.float32).values)
+        features_social.append(df_all.iloc[idx][social_cols].astype(np.int32).values)
+        features_stage.append(df_all.iloc[idx][stage_col].astype(np.float32).values)
+        targets.append(df_all.iloc[idx][TARGET])
+        dates.append(df_all.iloc[idx]["time"])
+    return (
+        np.array(features_epi, dtype=np.float32),
+        np.array(features_climate, dtype=np.float32),
+        np.array(features_social, dtype=np.int32),
+        np.array(features_stage, dtype=np.float32),
+        np.array(targets),
+        np.array(dates)
+    )
+
+def group_cv(df, plot_each_fold=False):
+    X_epi, X_climate, X_social, X_stage, y = get_inputs(df)
+    groups = df['season_group'].values
+    unique_groups = np.unique(groups)
+    n_splits = len(unique_groups)
+    gkf = GroupKFold(n_splits=n_splits)
+    r2_list, mae_list, rmse_list = [], [], []
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(X_epi, groups=groups)):
+        val_group = np.unique(groups[val_idx])[0]
+        val_df = df.iloc[val_idx]
+        val_mean = val_df[TARGET].mean()
+        val_var = val_df[TARGET].var()
+        if is_anomaly_season(val_mean, val_var):
+            print(f"Fold {fold+1}: Skipping low-activity season group {val_group}")
+            continue
+        print(f"Fold {fold+1}: train seasons:", np.unique(groups[train_idx]), "val season:", val_group)
+        scaler_epi = StandardScaler().fit(X_epi[train_idx])
+        scaler_climate = StandardScaler().fit(X_climate[train_idx])
+        Xtr_e, Xval_e = scaler_epi.transform(X_epi[train_idx]), scaler_epi.transform(X_epi[val_idx])
+        Xtr_c, Xval_c = scaler_climate.transform(X_climate[train_idx]), scaler_climate.transform(X_climate[val_idx])
+        Xtr_s, Xval_s = X_social[train_idx], X_social[val_idx]
+        Xtr_stage, Xval_stage = X_stage[train_idx], X_stage[val_idx]
+        ytr, yval = y[train_idx], y[val_idx]
+        sample_weight = get_sample_weight(df.iloc[train_idx])
+        model = build_multimodal_weighted_model()
+        early_stopping = get_early_stopping(validation=True)
+        model.fit([Xtr_e, Xtr_c, Xtr_s, Xtr_stage], ytr,
+                  validation_data=([Xval_e, Xval_c, Xval_s, Xval_stage], yval),
+                  epochs=EPOCHS, batch_size=BATCH_SIZE,
+                  callbacks=[early_stopping],
+                  verbose=0,
+                  sample_weight=sample_weight)
+        y_pred = model.predict([Xval_e, Xval_c, Xval_s, Xval_stage], batch_size=BATCH_SIZE).reshape(-1)
+        r2, mae, rmse = calc_metrics(yval, y_pred)
+        print(f"  R2={r2:.4f}, MAE={mae:.4f}, RMSE={rmse:.4f}")
+        r2_list.append(r2)
+        mae_list.append(mae)
+        rmse_list.append(rmse)
+        if plot_each_fold:
+            plt.figure(figsize=(10,4))
+            plt.plot(yval, label='Observed')
+            plt.plot(y_pred, label='Predicted')
+            plt.title(f'Fold {fold+1} Observed vs predicted', fontproperties=myfont)
+            plt.legend(prop=myfont)
+            plt.show()
+    r2_arr = np.array(r2_list)
+    mean_r2 = r2_arr.mean() if len(r2_arr) else float('nan')
+    std_r2 = r2_arr.std(ddof=1) if len(r2_arr) > 1 else float('nan')
+    se_r2 = std_r2 / np.sqrt(len(r2_arr)) if len(r2_arr) > 1 else float('nan')
+    tval = t.ppf(0.975, len(r2_arr)-1) if len(r2_arr) > 1 else float('nan')
+    ci_lower = mean_r2 - tval * se_r2 if len(r2_arr) > 1 else float('nan')
+    ci_upper = mean_r2 + tval * se_r2 if len(r2_arr) > 1 else float('nan')
+    print("\n====== Season-group cross-validation summary ======")
+    print(f"Mean R2: {mean_r2:.4f}")
+    print(f"R2 standard deviation: {std_r2:.4f}")
+    print(f"95%% confidence interval: [{ci_lower:.4f}, {ci_upper:.4f}]")
+    for i, (r2, mae, rmse) in enumerate(zip(r2_list, mae_list, rmse_list), 1):
+        print(f"  Fold {i}: R2={r2:.4f}, MAE={mae:.4f}, RMSE={rmse:.4f}")
+    return mean_r2, std_r2, (ci_lower, ci_upper)
+
+
+def train_final_and_predict(train_df, full_df, predict_start, predict_end, plot=True):
+    X_epi, X_climate, X_social, X_stage, y = get_inputs(train_df)
+    scaler_epi = StandardScaler().fit(X_epi)
+    scaler_climate = StandardScaler().fit(X_climate)
+    X_epi_scaled = scaler_epi.transform(X_epi)
+    X_climate_scaled = scaler_climate.transform(X_climate)
+    sample_weight = get_sample_weight(train_df)
+    model = build_multimodal_weighted_model()
+    print("Model architecture:")
+    model.summary()
+    print(f"Key parameters: EPOCHS={EPOCHS}, BATCH_SIZE={BATCH_SIZE}, random seed={SEED}")
+    early_stopping = get_early_stopping(validation=False)
+    model.fit([X_epi_scaled, X_climate_scaled, X_social, X_stage], y,
+              epochs=EPOCHS, batch_size=BATCH_SIZE,
+              callbacks=[early_stopping],
+              verbose=1,
+              sample_weight=sample_weight)
+    full_df["date"] = pd.to_datetime(full_df["time"]).dt.tz_localize(None)
+    mask = (full_df["date"] >= pd.to_datetime(predict_start)) & (full_df["date"] <= pd.to_datetime(predict_end)) \
+           & (full_df["season_group"] > 0)
+    df_predict = full_df.loc[mask].copy()
+    abnormal = abnormal_season_groups(df_predict)
+    df_predict = df_predict[~df_predict['season_group'].isin(abnormal)].reset_index(drop=True)
+    if len(df_predict) == 0:
+        print("No retained season observations were available in the prediction interval; no predictions were generated")
+        return None, None, None, None, None
+    # Prepend historical observations so that every test date has a complete input window
+    df_all = pd.concat([train_df, df_predict], axis=0).reset_index(drop=True)
+    target_times = df_predict["time"].tolist()
+    X_epi_p, X_climate_p, X_social_p, X_stage_p, y_p, dates = get_predict_samples_full_window(
+        df_all, pd.to_datetime(predict_start) - pd.Timedelta(days=1), WINDOW, target_times
+    )
+    # Standardization
+    X_epi_p = scaler_epi.transform(X_epi_p)
+    X_climate_p = scaler_climate.transform(X_climate_p)
+    y_pred = model.predict([X_epi_p, X_climate_p, X_social_p, X_stage_p], batch_size=BATCH_SIZE).reshape(-1)
+    # Estimate residual-based uncertainty intervals from training residuals
+    y_all_pred = model.predict([X_epi_scaled, X_climate_scaled, X_social, X_stage], batch_size=BATCH_SIZE).reshape(-1)
+    residuals = y - y_all_pred
+    stderr = residuals.std(ddof=1)
+    ci95 = 1.96 * stderr
+    lower = y_pred - ci95
+    lower = np.maximum(lower, 0)
+    upper = y_pred + ci95
+    r2 = r2_score(y_p, y_pred)
+    mae = mean_absolute_error(y_p, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_p, y_pred))
+    print(f"\nPrediction interval {predict_start} - {predict_end} metrics:")
+    print(f"R2={r2:.4f}, MAE={mae:.4f}, RMSE={rmse:.4f}")
+    print("Mean bounds of the 95%% residual-based uncertainty interval: [%.4f, %.4f]" % (lower.mean(), upper.mean()))
+    residual_pred = y_p - y_pred
+    print("Residual mean: %.4f, standard deviation: %.4f" % (residual_pred.mean(), residual_pred.std()))
+    corr = np.corrcoef(y_p, y_pred)[0, 1]
+    print("Pearson correlation between observed and predicted values (trend agreement): %.4f" % corr)
+    # Save predictions to CSV
+    save_predict_result_csv(
+        y_pred, lower, upper, y_p, dates,
+        f"revised_Multimodal_preds_{predict_start}_{predict_end}_lead{FORECAST_LEAD}wk.csv"
+    )
+    if plot:
+        import seaborn as sns
+        sns.set(style="whitegrid")
+        df_predict["date"] = pd.to_datetime(df_predict["date"]).dt.tz_localize(None)
+        x_dates = df_predict["date"]
+        fig = plt.figure(figsize=(13, 9))
+        gs = fig.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.22)
+        ax1 = fig.add_subplot(gs[0])
+        ax2 = fig.add_subplot(gs[1])
+
+        ax1.plot(x_dates, y_p, label="Observed", marker='o', color="#0072B2", linewidth=2)
+        ax1.plot(x_dates, y_pred, label="Predicted", marker='x', color="#D55E00", linewidth=2)
+        ax1.fill_between(x_dates, lower, upper, color='gray', alpha=0.2, label="95% residual-based uncertainty interval")
+        ax1.set_ylabel(TARGET, fontproperties=myfont)
+        ax1.set_title(f"Prediction interval {predict_start} - {predict_end}: observed and predicted values with uncertainty interval", fontproperties=myfont)
+        ax1.legend(frameon=True, fontsize=12, prop=myfont)
+        ax1.set_xticks(x_dates[::max(1,len(x_dates)//8)])
+        ax1.tick_params(axis='x', rotation=45)
+
+        bar = ax2.bar(x_dates, residual_pred, color="#F0E442", alpha=0.65, edgecolor="k", width=6)
+        ax2.plot(x_dates, residual_pred, color='#009E73', marker='o', linewidth=2, label="Residual")
+        ax2.axhline(residual_pred.mean(), color='r', linestyle='--', alpha=0.7, label='Mean residual')
+        ax2.axhline(0, color='k', linestyle=':', alpha=0.7)
+        ax2.set_ylabel("Residual (observed - predicted)", fontproperties=myfont)
+        ax2.set_title('Weekly prediction residuals', fontproperties=myfont)
+        ax2.set_xticks(x_dates[::max(1,len(x_dates)//8)])
+        ax2.tick_params(axis='x', rotation=45)
+        ax2.legend(frameon=True, fontsize=12, prop=myfont)
+        for rect in bar:
+            height = rect.get_height()
+            if np.abs(height) > 0.15:
+                ax2.text(rect.get_x() + rect.get_width()/2.0, height, f'{height:.2f}',
+                         ha='center', va='bottom' if height>=0 else 'top', fontsize=8, color='#333', fontproperties=myfont)
+        plt.subplots_adjust(hspace=0.22)
+        plt.show()
+    # Save the model and explanation inputs
+    model.save(f'revised_multimodal_model_2023_2024_lead{FORECAST_LEAD}wk.h5')
+    np.savez(
+        f'revised_multimodal_inputs_2023_2024_lead{FORECAST_LEAD}wk.npz',
+        X_epi_p=X_epi_p,
+        X_climate_p=X_climate_p,
+        X_social_p=X_social_p,
+        X_stage_p=X_stage_p,
+        y_p=y_p
+    )
+    return y_pred, lower, upper, y_p, dates
+
+if __name__ == "__main__":
+    print("Loading the training data after excluding low-activity seasons...")
+    train_df = load_train_data()
+    if train_df.empty:
+        print("No retained training seasons are available; execution cannot continue.")
+        sys.exit()
+    print("Running season-group cross-validation after excluding low-activity seasons...")
+    group_cv(train_df, plot_each_fold=False)
+    print("Loading the complete dataset...")
+    full_df = load_full_data()
+    if full_df.empty:
+        print("The complete dataset is empty; predictions cannot be generated.")
+        sys.exit()
+    print("Forecasting the 2023/24 season after excluding low-activity seasons...")
+    train_final_and_predict(train_df, full_df, PREDICT_START, PREDICT_END, plot=True)
